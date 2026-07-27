@@ -1,0 +1,59 @@
+name: Build & Release
+
+on:
+  push:
+    tags: ['v*']          # Release wird bei Tags wie v0.4.7.6 gebaut
+  workflow_dispatch: {}    # manuell ausloesbar
+
+permissions:
+  contents: write          # noetig, um Release-Assets anzuhaengen
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Abhaengigkeiten
+        run: pip install PySide6 pywin32 pyinstaller
+
+      - name: Version aus Tag ableiten
+        shell: bash
+        run: echo "APP_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Piper + deutsche Stimme (Thorsten high) buendeln (offline im Installer)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path piper | Out-Null
+          # Piper: archivierte, MIT-lizenzierte Standalone-Binary (self-contained, per Subprozess aufgerufen)
+          $piperUrl = 'https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_windows_amd64.zip'
+          Invoke-WebRequest -Uri $piperUrl -OutFile piper.zip
+          Expand-Archive piper.zip -DestinationPath piper_tmp -Force
+          Copy-Item piper_tmp/piper/* piper/ -Recurse -Force
+          # Deutsche Stimme Thorsten (high) von HuggingFace (rhasspy/piper-voices), fester Tag v1.0.0
+          $vbase = 'https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/de/de_DE/thorsten/high'
+          Invoke-WebRequest -Uri "$vbase/de_DE-thorsten-high.onnx"      -OutFile 'piper/de_DE-thorsten-high.onnx'
+          Invoke-WebRequest -Uri "$vbase/de_DE-thorsten-high.onnx.json" -OutFile 'piper/de_DE-thorsten-high.onnx.json'
+          # Fail-Loud: ohne Binary/Stimme darf kein Release entstehen
+          if (-not (Test-Path 'piper/piper.exe')) { throw 'piper.exe fehlt nach Download' }
+          if (-not (Test-Path 'piper/de_DE-thorsten-high.onnx')) { throw 'Thorsten-High-Stimme fehlt nach Download' }
+          Get-ChildItem piper
+
+      - name: PyInstaller-Build
+        run: pyinstaller installer/lmu_coach.spec --noconfirm
+
+      - name: Inno Setup installieren
+        run: choco install innosetup -y --no-progress
+
+      - name: Installer bauen
+        run: iscc installer\setup.iss
+
+      - name: Release veroeffentlichen
+        uses: softprops/action-gh-release@v2
+        with:
+          files: installer/Output/LMU-Consistency-Coach-Setup-*.exe
+          generate_release_notes: true
