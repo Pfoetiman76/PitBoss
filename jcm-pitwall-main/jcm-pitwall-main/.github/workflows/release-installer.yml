@@ -1,0 +1,111 @@
+name: Installer bauen
+
+# Zwei Wege, denselben Installer zu bauen:
+#   1) Tag pushen  ->  git tag v1.0.0 && git push origin v1.0.0
+#   2) Manuell     ->  Actions-Tab -> "Run workflow" -> Version eintragen (z.B. 1.0.0)
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version ohne v-Prefix, z.B. 1.0.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with: { python-version: '3.12' }
+
+      # Version + Tag EINMAL zentral bestimmen.
+      #   Tag-Push        -> aus github.ref_name (v1.0.0 -> 1.0.0)
+      #   workflow_dispatch -> aus dem Eingabefeld (1.0.0 -> Tag v1.0.0)
+      - name: Version bestimmen
+        id: ver
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+            $version = "${{ inputs.version }}" -replace '^v',''
+          } else {
+            $version = $env:GITHUB_REF_NAME -replace '^v',''
+          }
+          if ([string]::IsNullOrWhiteSpace($version)) { throw "Keine Version ermittelt." }
+          $tag = "v$version"
+          "version=$version" | Out-File $env:GITHUB_OUTPUT -Append
+          "tag=$tag"         | Out-File $env:GITHUB_OUTPUT -Append
+          Write-Host "Version: $version  |  Tag: $tag"
+
+      - name: PyInstaller
+        run: pip install --upgrade pyinstaller
+
+      # Release-Version in den Build schreiben -> updater.VERSION == Release-Tag.
+      # Verhindert, dass ein aktualisierter Client dasselbe Update endlos verlangt.
+      - name: Version in den Build schreiben
+        shell: pwsh
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          Set-Content -Path client/_version.py -Value "VERSION = `"$v`"" -Encoding UTF8
+          Write-Host "client/_version.py:"; Get-Content client/_version.py
+
+      - name: Fahrer-Fenster bauen
+        run: >
+          pyinstaller --noconfirm --onedir --windowed
+          --name JCM-Pitwall
+          --icon client/jcm.ico
+          --add-data "client/jcm.ico;."
+          --distpath dist --workpath build --specpath build
+          --paths client --collect-submodules pyLMUSharedMemory
+          --hidden-import tkinter
+          client/pitwall.py
+
+      - name: Einrichter bauen
+        run: >
+          pyinstaller --noconfirm --onedir --windowed
+          --name JCM-Pitwall-Einrichter
+          --icon client/jcm-einrichter.ico
+          --add-data "client/jcm-einrichter.ico;."
+          --distpath dist --workpath build --specpath build
+          --paths client --hidden-import tkinter
+          client/einrichter.py
+
+      # NEU: Inno Setup ist auf dem Runner nicht vorinstalliert -> selbst holen.
+      - name: Inno Setup installieren
+        run: choco install innosetup --no-progress -y
+        shell: pwsh
+
+      # ISCC danach robust suchen (fester Pfad war der alte Fehler).
+      - name: Installer bauen
+        shell: pwsh
+        run: |
+          $kandidaten = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+          )
+          $iscc = $kandidaten | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { $iscc = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source }
+          if (-not $iscc) { throw "ISCC.exe nicht gefunden - Inno Setup Installation fehlgeschlagen?" }
+          Write-Host "Nutze ISCC: $iscc"
+          & "$iscc" "/DAppVersion=${{ steps.ver.outputs.version }}" installer\setup.iss
+
+      - name: An das Release haengen
+        uses: softprops/action-gh-release@v2
+        with:
+          # Der eigentliche Fix: Tag explizit setzen. Beim manuellen Lauf gibt es
+          # keinen Tag-Ref -> die Action erstellt den Tag auf dem aktuellen Commit.
+          tag_name: ${{ steps.ver.outputs.tag }}
+          files: |
+            installer/Output/*.exe
+          body: |
+            **Installer für alle** — Fahrer wie Einrichter dieselbe Datei.
+
+            Beim ersten Start fragt das Fahrer-Fenster nach dem Team-Code.
+            Den erzeugt Marcel im Einrichter unter „3 · Verteilen".
+
+            Es sind keine Zugangsdaten im Installer.
