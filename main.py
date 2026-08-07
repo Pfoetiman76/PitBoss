@@ -8,9 +8,10 @@ import mmap
 import sys
 import subprocess
 import shutil
+import time
 import urllib.request
 import urllib.error
-from dataclasses import dataclass, astuple as _dc_astuple
+from dataclasses import dataclass, astuple as _dc_astuple, fields as _dc_fields
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -28,9 +29,11 @@ import ctypes
 from ai_quota import QuotaTracker, QuotaPanel  # 0.4.7.1: KI-Kontingent-Tracking
 from tts import SpeechEngine  # 0.4.7.2: Offline-Sprachausgabe
 import updater  # 0.4.7.5: Update-Pruefung ueber GitHub Releases
+import motec_import  # 0.5.9.27: MoTeC-i2-CSV-Export als zusaetzliche Report-Quelle fuer die KI-Analyse
 from PySide6.QtGui import QPainter, QPen, QColor, QBrush, QIcon, QPixmap, QDesktopServices, QShortcut, QKeySequence, QFont, QFontMetricsF, QLinearGradient, QPainterPath
 
-APP_VERSION = "0.5.9.18 Beta"
+APP_VERSION = "0.5.9.27 Beta"
+AUTO_SWITCH_DEBOUNCE_SAMPLES = 20  # 0.5.9.24: ~2s bei 10 Hz, bevor ein Strecken-/Fahrzeugwechsel als real gilt
 DARK_QSS = """
             QWidget { font-family: "Segoe UI", "Inter", sans-serif; font-size: 13px; color: #e8edf4; }
             QLabel { color: #e8edf4; background: transparent; }
@@ -294,6 +297,134 @@ def infer_vehicle_class(vehicle_class: str, vehicle_name: str = "", vehicle_mode
     if "hypercar" in txt or "lmh" in txt or "lmdh" in txt or "963" in txt or "499p" in txt:
         return "Hypercar"
     return (vehicle_class or "Unbekannt").strip() or "Unbekannt"
+
+
+# 0.5.9.21: Breites Tier-Format der "Ohne Speed's - LMU laptimes"-Tabelle
+# (eine Zeile pro Strecke/Klasse mit 8 Skill-Tier-Zeitspalten: Alien, Competitive,
+# Good x2, Midpack x2, Tail-ender, Offline). Ergaenzt den bestehenden flachen
+# Personal-Reference-Parser additiv, ersetzt ihn nicht.
+def parse_personal_laptime_reference_wide_csv(text: str) -> List[dict]:
+    if not text:
+        return []
+    try:
+        dialect = csv.Sniffer().sniff(text[:4096], delimiters=',;\t')
+    except Exception:
+        dialect = csv.excel
+    rows = list(csv.reader(text.splitlines(), dialect=dialect))
+    n_rows = len(rows)
+    entries: List[dict] = []
+
+    def cell_at(r, c):
+        return r[c].strip() if 0 <= c < len(r) else ''
+
+    for idx, row in enumerate(rows):
+        track_col = None
+        for ci, cell in enumerate(row):
+            if normalize_match_text(cell) == 'track':
+                track_col = ci
+                break
+        if track_col is None:
+            continue
+        patch_col = track_col + 1
+        hotlap_col = track_col + 2
+        tier_cols = [track_col + 3 + j for j in range(8)]
+        fastest_car_col = track_col + 11
+        laptime_col = track_col + 12
+        class_col = track_col + 15
+
+        # Tiernamen: aus der Zeile ueber dem Header, Merged-Cell-Luecken werden
+        # mit dem letzten bekannten Namen aufgefuellt (Good/Midpack belegen je 2 Spalten).
+        name_row = rows[idx - 1] if idx - 1 >= 0 else []
+        tier_names = []
+        last_name = ''
+        for c in tier_cols:
+            v = cell_at(name_row, c)
+            if v:
+                last_name = v
+            tier_names.append(last_name or '?')
+
+        tier_pcts = []
+        for c in tier_cols:
+            v = cell_at(row, c).replace('~', '').replace('%', '').strip()
+            try:
+                tier_pcts.append(float(v))
+            except Exception:
+                tier_pcts.append(0.0)
+
+        r = idx + 1
+        while r < n_rows:
+            drow = rows[r]
+            track = cell_at(drow, track_col)
+            if not track:
+                break
+            tiers = []
+            valid = 0
+            for c, tname, tpct in zip(tier_cols, tier_names, tier_pcts):
+                t_s = parse_lap_time_to_seconds(cell_at(drow, c))
+                if t_s > 0:
+                    valid += 1
+                tiers.append({'name': tname, 'pct': tpct, 'time_s': t_s})
+            if valid >= 4:  # Plausibilitaets-Guard: die meisten Tiers muessen vorhanden sein
+                vclass_raw = cell_at(drow, class_col)
+                entries.append({
+                    'track': track,
+                    'patch': cell_at(drow, patch_col),
+                    'hotlap_q_s': parse_lap_time_to_seconds(cell_at(drow, hotlap_col)),
+                    'fastest_car': cell_at(drow, fastest_car_col),
+                    'fastest_laptime_s': parse_lap_time_to_seconds(cell_at(drow, laptime_col)),
+                    'vehicle_class_raw': vclass_raw,
+                    'vehicle_class': infer_vehicle_class(vclass_raw),
+                    'tiers': tiers,
+                })
+            r += 1
+    return entries
+
+
+# 0.5.9.21: LMU liefert ueber Shared Memory (mTrackName) Venue-/Event-Namen, die
+# vom Sheet-Streckennamen abweichen (z.B. LMU "8 Hours of Bahrain" vs. Sheet
+# "Bahrain (wec)"). Feste Alias-Tabelle statt Substring-Raten, validiert gegen
+# die reale LMU REST-Streckenliste (/rest/race/track) - 36/36 Nicht-Showroom-Tracks
+# aufgeloest. Deckt name/shortName/sceneDesc ab, falls mTrackName eine dieser
+# Formen liefert.
+PERSONAL_LAPTIME_TRACK_ALIAS_RAW = {
+    'Portimao': ('4 Hours of Portimao', '6 Hours of Portimao', 'Algarve International Circuit 1.23', 'PORTIMAOELMS', 'PORTIMAOWEC',),
+    'Imola': ('4 Hours of Imola', '6 Hours of Imola', 'Autodromo Enzo e Dino Ferrari 1.27', 'IMOLAELMS', 'IMOLAWEC',),
+    'Monza': ('6 Hours of Monza', 'Autodromo Nazionale Monza 1.29', 'MONZAWEC',),
+    'Monza (curvagrande)': ('Monza Curva Grande Circuit', 'MONZAWEC_GRANDE',),
+    'Interlagos': ('Rolex 6 Hours Of Sao Paulo', 'Autódromo José Carlos Pace 1.27', 'INTERLAGOSWEC',),
+    'Bahrain (wec)': ('8 Hours of Bahrain', 'BAHRAINWEC',),
+    'Bahrain (endurance)': ('Bahrain Endurance Circuit', 'BAHRAINWEC_ENDCE',),
+    'Bahrain (outer)': ('Bahrain Outer Circuit', 'BAHRAINWEC_OUTER',),
+    'Bahrain (paddock)': ('Bahrain Paddock Circuit', 'BAHRAINWEC_PADDOCK',),
+    'Barcelona': ('4 Hours of Barcelona', 'Circuit de Barcelona 1.03', 'BARCELONAELMS',),
+    'Spa': ('4 Hours of Spa-Francorchamps', '6 Hours of Spa-Francorchamps', 'Circuit de Spa-Francorchamps Endurance', 'Circuit de Spa-Francorchamps 1.29', 'SPAELMS', 'SPAWEC', 'SPAWEC_ENDCE',),
+    'Circuit de la Sarthe': ('24 Heures du Mans', 'Circuit de la Sarthe 1.33', 'LEMANSWEC',),
+    'Circuit de la Sarthe (straight)': ('Circuit de la Sarthe Mulsanne', 'LEMANSWEC_MULSANNE',),
+    'COTA (national)': ('COTA National Circuit', 'COTAWEC_NATIONAL',),
+    'COTA': ('Lone Star Le Mans', 'Circuit of the Americas 1.27', 'COTAWEC',),
+    'Daytona': ('Daytona International Speedway Road Course', 'Daytona International Speedway 1.01', 'DAYTONARC',),
+    'Fuji (chicane)': ('6 Hours of Fuji', 'Fuji Speedway 1.27', 'FUJIWEC',),
+    'Fuji (classic)': ('Fuji Speedway Classic', 'FUJIWEC_CL',),
+    'Qatar (short)': ('Lusail Short Circuit', 'QATARWEC_SHORT',),
+    'Qatar': ('Qatar 1812KM', 'Lusail International Circuit 1.27', 'QATARWEC',),
+    'Paul Ricard': ('4 Hours of Castellet', 'Paul Ricard Circuit 1.07', 'PAULRICARDELMS',),
+    'Paul Ricard (1A)': ('Paul Ricard - 1A', 'PAULRICARD1A',),
+    'Paul Ricard (1A v2)': ('Paul Ricard - 1A-V2', 'PAULRICARD1A-V2',),
+    'Paul Ricard (1A v2 short)': ('Paul Ricard - 1A-V2-Short', 'PAULRICARD1A-V2-SHORT',),
+    'Paul Ricard (3A)': ('Paul Ricard - 3A', 'PAULRICARD3A',),
+    'Sebring': ('1000 Miles of Sebring', 'Sebring International Raceway 1.27', 'SEBRINGWEC',),
+    'Sebring (school)': ('Sebring School Circuit', 'SEBRINGWEC_SCHOOL',),
+    'Silverstone (GP)': ('4 Hours of Silverstone', '6 Hours of Silverstone', 'Silverstone Circuit 1.11', 'SILVERSTONEELMS', 'SILVERSTONEWEC',),
+    'Silverstone (International)': ('Silverstone International Circuit', 'SILVERSTONE_INTERNATIONAL',),
+    'Silverstone (National)': ('Silverstone National Circuit', 'SILVERSTONE_NATIONAL',),
+    'Laguna Seca': ('WeatherTech Raceway Laguna Seca', 'WeatherTech Raceway Laguna Seca 1.01', 'LAGUNASECA',),
+}
+
+# normalisierte Lookup-Tabelle: normalize_match_text(LMU-Variante) -> Sheet-Streckenname
+PERSONAL_LAPTIME_TRACK_ALIASES = {}
+for _sheet_key, _variants in PERSONAL_LAPTIME_TRACK_ALIAS_RAW.items():
+    for _v in _variants:
+        PERSONAL_LAPTIME_TRACK_ALIASES[normalize_match_text(_v)] = _sheet_key
 
 
 def safe_filename_part(text: str) -> str:
@@ -1422,10 +1553,22 @@ class LapTimeOverlayWindow(OverlayStyleMixin, QWidget):
         self.setMinimumSize(360, 96)
         self._d = None
         self._delta = 0.0
+        self._clock_anchor_raw = None   # 0.5.9.26: fuer Echtzeit-Extrapolation, s.u.
+        self._clock_anchor_ts = None
         self._drag = None
+        self._self_timer = QTimer(self)  # 0.5.9.26: eigener Repaint-Takt
+        self._self_timer.setInterval(50)  # 20 Hz, unabhaengig von den anderen ~12 Overlay-Repaints
+        self._self_timer.timeout.connect(self._self_tick)
+        self._self_timer.start()
+
+    def _self_tick(self):  # 0.5.9.26
+        if self.isVisible():
+            self.update()  # paintEvent extrapoliert AKTUELL frisch per time.monotonic()
 
     def update_from_main(self, main):
         self._d = getattr(main, "last_live_sample", None) or (main.samples[-1] if getattr(main, "samples", None) else None)
+        self._clock_anchor_raw = getattr(main, "_live_clock_anchor_raw", None)  # 0.5.9.26
+        self._clock_anchor_ts = getattr(main, "_live_clock_anchor_ts", None)
         try:
             self._delta = float(getattr(main, "live_delta_s", 0.0) or 0.0)
         except Exception:
@@ -1462,7 +1605,10 @@ class LapTimeOverlayWindow(OverlayStyleMixin, QWidget):
             p.setPen(self._muted()); p.setFont(QFont("Segoe UI", 9))
             p.drawText(QRectF(ring + 24, 0, w - ring - 32, h), Qt.AlignVCenter | Qt.AlignLeft, "warte auf Telemetrie")
             p.end(); return
-        cur = float(getattr(s, "current_lap_time", 0.0) or 0.0)
+        cur = (self._clock_anchor_raw + (time.monotonic() - self._clock_anchor_ts)) \
+              if self._clock_anchor_raw is not None and self._clock_anchor_ts is not None \
+              else float(getattr(s, "current_lap_time", 0.0) or 0.0)
+        cur = max(0.0, cur)
         best = float(getattr(s, "best_lap_time", 0.0) or 0.0)
         last = float(getattr(s, "last_lap_time", 0.0) or 0.0)
         pred = (best + delta) if best > 0 else last
@@ -2557,12 +2703,22 @@ class PedalOverlayWindow(OverlayStyleMixin, QWidget):
         self._col_brk = QColor("#f85149")
         self._col_str = QColor("#58a6ff")
         self._gear = 0
+        self._last_push_ts = time.monotonic()  # 0.5.9.26: fuer sanftes Zwischen-Scrollen
+        self._self_timer = QTimer(self)  # 0.5.9.26: eigener Repaint-Takt, s. paintEvent-Shift
+        self._self_timer.setInterval(33)  # ~30 Hz
+        self._self_timer.timeout.connect(self._self_tick)
+        self._self_timer.start()
+
+    def _self_tick(self):  # 0.5.9.26
+        if self.isVisible():
+            self.update()
 
     def _push(self, thr, brk, srt):
         for buf, val in ((self._thr, thr), (self._brk, brk), (self._str, srt)):
             buf.append(val)
             if len(buf) > self.HISTORY:
                 del buf[0:len(buf) - self.HISTORY]
+        self._last_push_ts = time.monotonic()  # 0.5.9.26
 
     def update_from_main(self, main):
         s = getattr(main, "last_live_sample", None) or (main.samples[-1] if getattr(main, "samples", None) else None)
@@ -2599,7 +2755,13 @@ class PedalOverlayWindow(OverlayStyleMixin, QWidget):
     def _step(self, plot_w):
         return plot_w / (self.HISTORY - 1)
 
-    def _path(self, buf, x0, plot_w, y_at):
+    def _scroll_shift_px(self, plot_w):  # 0.5.9.26: sanfter Zwischen-Scroll statt 100ms-Sprung
+        step = self._step(plot_w)
+        period = 0.1  # Sample-Intervall (10 Hz Recorder/Live-Tick)
+        frac = (time.monotonic() - self._last_push_ts) / period
+        return min(step, max(0.0, frac) * step)
+
+    def _path(self, buf, x0, plot_w, y_at, shift_px=0.0):
         path = QPainterPath()
         n = len(buf)
         if n < 2:
@@ -2607,7 +2769,7 @@ class PedalOverlayWindow(OverlayStyleMixin, QWidget):
         step = self._step(plot_w)
         start = self.HISTORY - n  # rechtsbuendig: neueste Werte rechts
         for i, v in enumerate(buf):
-            x = x0 + (start + i) * step
+            x = x0 + (start + i) * step - shift_px
             y = y_at(v)
             if i == 0:
                 path.moveTo(x, y)
@@ -2646,9 +2808,10 @@ class PedalOverlayWindow(OverlayStyleMixin, QWidget):
         p.drawLine(int(x0), int(mid), int(x0 + plot_w), int(mid))
 
         # Gas: Flaeche + Linie
-        thr_path = self._path(self._thr, x0, plot_w, y_ped)
+        shift_px = self._scroll_shift_px(plot_w)  # 0.5.9.26
+        thr_path = self._path(self._thr, x0, plot_w, y_ped, shift_px)
         if not thr_path.isEmpty():
-            first_x = x0 + (self.HISTORY - len(self._thr)) * self._step(plot_w)
+            first_x = x0 + (self.HISTORY - len(self._thr)) * self._step(plot_w) - shift_px
             fill = QPainterPath(thr_path)
             fill.lineTo(x0 + plot_w, bottom)
             fill.lineTo(first_x, bottom)
@@ -2658,12 +2821,12 @@ class PedalOverlayWindow(OverlayStyleMixin, QWidget):
             p.setPen(QPen(self._col_thr, 2)); p.setBrush(Qt.NoBrush); p.drawPath(thr_path)
 
         # Bremse: Linie
-        brk_path = self._path(self._brk, x0, plot_w, y_ped)
+        brk_path = self._path(self._brk, x0, plot_w, y_ped, shift_px)
         if not brk_path.isEmpty():
             p.setPen(QPen(self._col_brk, 2)); p.setBrush(Qt.NoBrush); p.drawPath(brk_path)
 
         # Lenkung: Linie um die Mitte
-        str_path = self._path(self._str, x0, plot_w, y_str)
+        str_path = self._path(self._str, x0, plot_w, y_str, shift_px)
         if not str_path.isEmpty():
             p.setPen(QPen(self._col_str, 1.6)); p.setBrush(Qt.NoBrush); p.drawPath(str_path)
 
@@ -3622,6 +3785,21 @@ class GeminiWindow(QWidget):
         self.setStyleSheet(LIGHT_QSS if getattr(main, "_theme", "dark") == "light" else DARK_QSS)
         lay = QVBoxLayout(self)
         lay.addWidget(QLabel(f"Google Gemini  ·  Modell: {GEMINI_MODEL}"))
+        # 0.5.9.25: Report-Auswahl — Live-Session ODER ein beliebiger gespeicherter Report
+        report_row = QHBoxLayout()
+        report_row.addWidget(QLabel("Report:"))
+        self.report_combo = QComboBox()
+        self.report_combo.setMinimumWidth(320)
+        report_row.addWidget(self.report_combo, stretch=1)
+        self.btn_report_refresh = QPushButton("Aktualisieren")
+        self.btn_report_refresh.setToolTip("Liste der gespeicherten Reports neu einlesen.")
+        report_row.addWidget(self.btn_report_refresh)
+        self.btn_report_browse = QPushButton("Datei wählen…")
+        self.btn_report_browse.setToolTip("Report-Datei von einem anderen Ort laden.")
+        report_row.addWidget(self.btn_report_browse)
+        lay.addLayout(report_row)
+        self.btn_report_refresh.clicked.connect(self.refresh_report_list)
+        self.btn_report_browse.clicked.connect(self.browse_report_file)
         row = QHBoxLayout()
         row.addWidget(QLabel("API-Key:"))
         self.key_edit = QLineEdit()
@@ -3690,6 +3868,7 @@ class GeminiWindow(QWidget):
         key = getattr(main, "gemini_api_key", "") or ""
         self.key_edit.setText(key)
         self.status.setText("API-Key geladen." if key else "Kein API-Key gespeichert.")
+        self.refresh_report_list()  # 0.5.9.25: erst nach self.status befuellen
 
     def save_key(self):
         key = self.key_edit.text().strip()
@@ -3700,17 +3879,67 @@ class GeminiWindow(QWidget):
         except Exception as e:
             self.status.setText(f"Speichern fehlgeschlagen: {e}")
 
+    def refresh_report_list(self):  # 0.5.9.25
+        current_path = self.report_combo.currentData() if self.report_combo.count() else None
+        self.report_combo.blockSignals(True)
+        self.report_combo.clear()
+        self.report_combo.addItem("Aktuelle Session (Live)", None)
+        try:
+            files = sorted(REPORT_DIR.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)
+        except Exception:
+            files = []
+        for f in files:
+            self.report_combo.addItem(f.name, str(f))
+        # zuvor gewaehlte Datei nach Refresh wieder anwaehlen, falls noch vorhanden
+        if current_path:
+            idx = self.report_combo.findData(current_path)
+            if idx >= 0:
+                self.report_combo.setCurrentIndex(idx)
+        self.report_combo.blockSignals(False)
+        if not files:
+            self.status.setText("Keine gespeicherten Reports gefunden (Dokumente\\PitBoss\\reports).")
+
+    def browse_report_file(self):  # 0.5.9.25, erweitert 0.5.9.27 um MoTeC-CSV
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Report- oder MoTeC-CSV-Datei wählen", str(REPORT_DIR) if REPORT_DIR.is_dir() else "",
+            "Report/MoTeC (*.txt *.csv);;PitBoss-Reports (*.txt);;MoTeC-CSV-Export (*.csv);;Alle Dateien (*)"
+        )
+        if not path:
+            return
+        idx = self.report_combo.findData(path)
+        if idx < 0:
+            self.report_combo.insertItem(1, Path(path).name, path)
+            idx = 1
+        self.report_combo.setCurrentIndex(idx)
+
     def analyze(self):
         self.main.gemini_api_key = self.key_edit.text().strip()
-        try:
-            report = self.main.build_report()
-        except Exception as e:
-            self.status.setText(f"Report-Erzeugung fehlgeschlagen: {e}")
-            return
+        sel_path = self.report_combo.currentData() if self.report_combo.count() else None
+        if sel_path is None:
+            try:
+                report = self.main.build_report()
+            except Exception as e:
+                self.status.setText(f"Report-Erzeugung fehlgeschlagen: {e}")
+                return
+            source_label = "aktuelle Live-Session"
+        else:
+            try:
+                if str(sel_path).lower().endswith(".csv"):
+                    report = motec_import.build_motec_report(sel_path)  # 0.5.9.27
+                else:
+                    report = Path(sel_path).read_text(encoding="utf-8")
+            except ValueError as e:
+                # motec_import wirft ValueError mit verstaendlicher Meldung bei Formatproblemen
+                self.status.setText(f"MoTeC-CSV konnte nicht gelesen werden: {e}")
+                return
+            except Exception as e:
+                self.status.setText(f"Report-Datei konnte nicht gelesen werden: {e}")
+                return
+            source_label = Path(sel_path).name
         if not report or not report.strip():
-            self.status.setText("Kein Report vorhanden. Erst eine Runde aufzeichnen.")
+            self.status.setText("Kein Report vorhanden. Erst eine Runde aufzeichnen oder anderen Report wählen.")
             return
-        self.status.setText("Sende Report an Gemini ...")
+        self.status.setText(f"Sende Report ({source_label}) an Gemini ...")
         QApplication.processEvents()
         system = ("Du bist ein erfahrener Sim-Racing-Renningenieur fuer Le Mans Ultimate. "
                   "Analysiere den folgenden Telemetrie-Report und gib konkretes, priorisiertes "
@@ -5795,6 +6024,9 @@ class Main(QMainWindow):
         self.tire_overlay_autostart = True
         self._tire_overlay_autoshown = False
         self.auto_bestlap_export_enabled = True
+        self.auto_switch_recording_enabled = True  # 0.5.9.24: Auto-Stop/Start bei Strecken-/Fahrzeugwechsel
+        self.pending_switch_signature = None
+        self.pending_switch_count = 0
         self.auto_bestlap_export_path = None
         self.auto_bestlap_lap_number = None
         self.auto_bestlap_time_s = None
@@ -5808,6 +6040,15 @@ class Main(QMainWindow):
         self.global_hotkey_state = {"F6": False, "F7": False, "F8": False, "F9": False, "F10": False, "F11": False, "F12": False}
         self.last_tire_overlay_hotkey_ts = 0.0
         self.last_live_sample = None
+        self.live_log_enabled = False  # 0.5.9.26: Live-Telemetrie-Log, unabhaengig vom Recording
+        self.live_log_writer = None
+        self.live_log_fh = None
+        self.live_log_path = None
+        self.live_log_row_count = 0
+        self.live_smooth_lap_time = None  # 0.5.9.26: eigener Echtzeit-Rundentimer, s.u.
+        self._live_clock_anchor_raw = None
+        self._live_clock_anchor_ts = None
+        self._live_clock_lap = None
         self.live_lap_number = None
         self.live_lap_samples: List[Sample] = []
         self.live_delta_s = None
@@ -5820,6 +6061,7 @@ class Main(QMainWindow):
         self.live_best_reference_lap = None
         self.live_best_reference_time_s = None
         self.personal_laptime_reference = self.load_personal_laptime_reference()
+        self.personal_laptime_reference_tracks = self.load_personal_laptime_reference_tracks()  # 0.5.9.21: Tier-Format
         self.personal_reference_source = str(PERSONAL_LAPTIME_REFERENCE_PATH) if PERSONAL_LAPTIME_REFERENCE_PATH.exists() else "nicht geladen"
         self.live_timer = QTimer(self)
         self.live_timer.setInterval(100)
@@ -5893,9 +6135,16 @@ class Main(QMainWindow):
         self.btn_tire_overlay = QPushButton("Reifen-Overlay")
         self.btn_pedal_overlay = QPushButton("Pedal-Overlay")  # 0.4.7.1
         self.btn_auto_bestlap = QPushButton("Auto-Bestlap: AN")
+        self.btn_auto_switch = QPushButton("Auto-Wechsel: AN")  # 0.5.9.24
+        self.btn_live_log = QPushButton("Live-Log: AUS")  # 0.5.9.26
+        self.btn_live_log.setToolTip(
+            "Zeichnet die komplette rohe Live-Telemetrie (unabhaengig vom normalen "
+            "Recording) laufend in eine CSV auf \u2013 z.B. um ein konkretes Overlay-\n"
+            "Problem exakt nachzuvollziehen. Datei liegt in Dokumente\\PitBoss\\csv."
+        )
         # 0.4.8.1: Recording als Toggle, Overlays als Dropdown, Snapshot automatisch/manuell im Menue
         primary = [self.btn_record, self.btn_report]
-        overflow = [self.btn_snapshot, self.btn_stop, self.btn_csv, self.btn_ref_export, self.btn_ref_import, self.btn_pb_reference, self.btn_auto_bestlap, self.btn_overlay, self.btn_tire_overlay, self.btn_pedal_overlay, self.btn_export, self.btn_clear]
+        overflow = [self.btn_snapshot, self.btn_stop, self.btn_csv, self.btn_ref_export, self.btn_ref_import, self.btn_pb_reference, self.btn_auto_bestlap, self.btn_auto_switch, self.btn_live_log, self.btn_overlay, self.btn_tire_overlay, self.btn_pedal_overlay, self.btn_export, self.btn_clear]
         for b in primary:
             buttons.addWidget(b)
         for b in overflow:
@@ -5981,6 +6230,8 @@ class Main(QMainWindow):
         _more.addAction("PB-Referenz laden", self.btn_pb_reference.click)
         _more.addSeparator()
         _more.addAction("Auto-Bestlap umschalten", self.btn_auto_bestlap.click)
+        _more.addAction("Auto-Wechsel umschalten", self.btn_auto_switch.click)
+        _more.addAction("Live-Log umschalten", self.btn_live_log.click)
         _more.addAction("Snapshot lesen (manuell)", lambda: self.snapshot())
         _more.addSeparator()
         _more.addAction("Export-Ordner öffnen", self.btn_export.click)
@@ -6367,6 +6618,7 @@ class Main(QMainWindow):
         self.apply_profile_to_fields(self.current_profile_name)
 
         self.set_auto_bestlap_ui()
+        self.set_auto_switch_ui()
         self.btn_snapshot.clicked.connect(self.snapshot)
         self.btn_record.clicked.connect(self.toggle_recording)
         self.btn_stop.clicked.connect(self.stop_recording)
@@ -6378,6 +6630,8 @@ class Main(QMainWindow):
         self.btn_ref_import.clicked.connect(self.import_reference_lap)
         self.btn_pb_reference.clicked.connect(self.import_personal_laptime_reference)
         self.btn_auto_bestlap.clicked.connect(self.toggle_auto_bestlap_export)
+        self.btn_auto_switch.clicked.connect(self.toggle_auto_switch_recording)
+        self.btn_live_log.clicked.connect(self.toggle_live_log)
         self.btn_overlay.clicked.connect(self.toggle_overlay)
         self.btn_tire_overlay.clicked.connect(self.toggle_tire_overlay)
         self.btn_pedal_overlay.clicked.connect(self.toggle_pedal_overlay)
@@ -7743,6 +7997,20 @@ $all | Where-Object { $_.Name -or $_.DeviceID } | ConvertTo-Json -Depth 3
                 pass
             return []
 
+    def load_personal_laptime_reference_tracks(self) -> List[dict]:
+        """0.5.9.21: Laedt dieselbe lokal zwischengespeicherte CSV-Datei zusaetzlich
+        im breiten Tier-Format (Strecke x Skill-Level-Zeiten). Additiv zur bestehenden
+        flachen Referenz; wird beim Dashboard/Report bevorzugt genutzt, sofern die
+        aktuelle Strecke/Klasse dort gefunden wird."""
+        path = PERSONAL_LAPTIME_REFERENCE_PATH
+        if not path.exists():
+            return []
+        try:
+            with open(path, 'r', encoding='utf-8-sig', newline='') as f:
+                return parse_personal_laptime_reference_wide_csv(f.read())
+        except Exception:
+            return []
+
     def parse_personal_laptime_reference_csv(self, text: str) -> List[dict]:
         if not text:
             return []
@@ -7810,9 +8078,11 @@ $all | Where-Object { $_.Name -or $_.DeviceID } | ConvertTo-Json -Depth 3
                 PERSONAL_LAPTIME_REFERENCE_PATH.write_text(data, encoding='utf-8')
                 self.personal_reference_source = path
             self.personal_laptime_reference = self.parse_personal_laptime_reference_csv(data)
-            self.log.append(f"PB-Referenz geladen: {len(self.personal_laptime_reference)} plausible Zeiten | Quelle: {self.personal_reference_source}")
+            self.personal_laptime_reference_tracks = parse_personal_laptime_reference_wide_csv(data)  # 0.5.9.21
+            tier_info = f" | {len(self.personal_laptime_reference_tracks)} Strecken/Klassen mit Skill-Tiers" if self.personal_laptime_reference_tracks else ""
+            self.log.append(f"PB-Referenz geladen: {len(self.personal_laptime_reference)} plausible Zeiten{tier_info} | Quelle: {self.personal_reference_source}")
             self.refresh_dashboard()
-            QMessageBox.information(self, "PB-Referenz geladen", f"{len(self.personal_laptime_reference)} plausible Zeiten geladen.\nDie persönliche Bestzeit wird jetzt im Dashboard/Report eingeordnet.")
+            QMessageBox.information(self, "PB-Referenz geladen", f"{len(self.personal_laptime_reference)} plausible Zeiten geladen.{tier_info}\nDie persönliche Bestzeit wird jetzt im Dashboard/Report eingeordnet.")
         except Exception as e:
             QMessageBox.warning(self, "PB-Referenz laden", f"PB-Referenz konnte nicht geladen werden:\n{e}\n\nTipp: Tabelle als CSV herunterladen und lokal laden.")
 
@@ -7823,7 +8093,71 @@ $all | Where-Object { $_.Name -or $_.DeviceID } | ConvertTo-Json -Depth 3
         clean = [self.lap_time_for_report(l) for l in self.lap_summaries if l.is_clean and self.lap_time_for_report(l) > 0]
         return min(clean) if clean else 0.0
 
+    def personal_laptime_reference_tier_match(self) -> Optional[dict]:
+        """0.5.9.21: Praezise Einordnung anhand der Skill-Tier-Tabelle (Strecke + Klasse
+        exakt gematcht). Liefert None, wenn keine passende Zeile gefunden wird - der
+        Aufrufer faellt dann auf die bestehende, generische Prozent-Einordnung zurueck."""
+        pb = self.current_best_lap_time_s()
+        if pb <= 0:
+            return None
+        tracks = getattr(self, 'personal_laptime_reference_tracks', []) or []
+        if not tracks:
+            return None
+        last = self.samples[-1] if self.samples else None
+        if last is None:
+            return None
+        cur_track_raw = getattr(last, 'track', '')
+        cur_track = normalize_match_text(cur_track_raw)
+        cur_class = infer_vehicle_class(getattr(last, 'vehicle_class', ''), getattr(last, 'vehicle_name', ''), getattr(last, 'vehicle_model', ''))
+        if not cur_track:
+            return None
+        # 0.5.9.21: feste Alias-Aufloesung zuerst (LMU-Venue-Name -> Sheet-Streckenname),
+        # da LMU-Namen (z.B. "8 Hours of Bahrain") oft keinerlei Substring-Ueberlappung
+        # mit dem Sheet-Namen (z.B. "Bahrain (wec)") haben.
+        alias_target = PERSONAL_LAPTIME_TRACK_ALIASES.get(cur_track)
+        if alias_target:
+            candidates = [e for e in tracks if normalize_match_text(e['track']) == normalize_match_text(alias_target)]
+        else:
+            candidates = [e for e in tracks if normalize_match_text(e['track']) == cur_track]
+        if not candidates:
+            candidates = [e for e in tracks if cur_track in normalize_match_text(e['track']) or normalize_match_text(e['track']) in cur_track]
+        if not candidates:
+            return None
+        class_matches = [e for e in candidates if e.get('vehicle_class') == cur_class]
+        row = class_matches[0] if class_matches else candidates[0]
+        tiers = row.get('tiers') or []
+        tiers_valid = [t for t in tiers if t.get('time_s', 0) > 0]
+        if not tiers_valid:
+            return None
+        tiers_sorted = sorted(tiers_valid, key=lambda t: t['time_s'])
+        faster_than_pb = [t for t in tiers_sorted if t['time_s'] < pb]
+        slower_or_eq = [t for t in tiers_sorted if t['time_s'] >= pb]
+        if not faster_than_pb:
+            band = f"schneller als {tiers_sorted[0]['name']}"
+        elif not slower_or_eq:
+            band = f"langsamer als {tiers_sorted[-1]['name']}"
+        else:
+            band = slower_or_eq[0]['name']
+        class_note = f" ({row.get('vehicle_class_raw')})" if row.get('vehicle_class_raw') else ""
+        if not class_matches:
+            class_note += " – Klasse nicht exakt gematcht, nächstbeste Strecke verwendet"
+        txt = f"PB {fmt_lap_time(pb)} | {band}{class_note} | {row['track']}"
+        detail = ["", "Persönlicher Bestzeiten-Referenzbereich 0.5.9.21 (Skill-Tiers):",
+                   f"Quelle: {getattr(self, 'personal_reference_source', 'nicht geladen')}",
+                   f"Strecke: {row['track']}{class_note}",
+                   f"Aktuelle persönliche Bestzeit: {fmt_lap_time(pb)} | Einordnung: {band}"]
+        pb_marker_tier = slower_or_eq[0] if slower_or_eq else None
+        for t in tiers_sorted:
+            marker = " <- du" if t is pb_marker_tier else ""
+            detail.append(f"  {t['name']} ({t['pct']:.0f}%): {fmt_lap_time(t['time_s'])}{marker}")
+        if row.get('fastest_car'):
+            detail.append(f"Schnellstes Auto in der Tabelle: {row['fastest_car']} | {fmt_lap_time(row.get('fastest_laptime_s', 0))}")
+        return {'status': band, 'text': txt, 'lines': detail}
+
     def personal_laptime_reference_match(self) -> dict:
+        tier_result = self.personal_laptime_reference_tier_match()  # 0.5.9.21: praezise Tabelle bevorzugen
+        if tier_result:
+            return tier_result
         pb = self.current_best_lap_time_s()
         if pb <= 0:
             return {'status': 'keine PB', 'text': 'noch keine gültige Bestzeit'}
@@ -7985,11 +8319,77 @@ $all | Where-Object { $_.Name -or $_.DeviceID } | ConvertTo-Json -Depth 3
         self.btn_auto_bestlap.setToolTip("F7: Auto-Bestlap AN/AUS")
         self.status.setText(f"Auto-Bestlap {state}.")
 
+    def toggle_live_log(self):  # 0.5.9.26
+        if self.live_log_enabled:
+            self.stop_live_log()
+        else:
+            self.start_live_log()
+
+    def start_live_log(self):  # 0.5.9.26
+        try:
+            CSV_DIR.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = CSV_DIR / f"live_log_{ts}.csv"
+            fh = open(path, "w", newline="", encoding="utf-8")
+            fieldnames = [f.name for f in _dc_fields(Sample)]
+            writer = csv.writer(fh)
+            writer.writerow(fieldnames)
+            self.live_log_fh = fh
+            self.live_log_writer = writer
+            self.live_log_path = path
+            self.live_log_row_count = 0
+            self.live_log_enabled = True
+            self.btn_live_log.setText("Live-Log: AN")
+            self.log.append(f"Live-Log gestartet: {path.name} (unabhaengig vom Recording, jeder Live-Tick wird mitgeschrieben).")
+        except Exception as e:
+            self.live_log_enabled = False
+            QMessageBox.warning(self, "Live-Log", f"Live-Log konnte nicht gestartet werden:\n{e}")
+
+    def stop_live_log(self):  # 0.5.9.26
+        self.live_log_enabled = False
+        self.btn_live_log.setText("Live-Log: AUS")
+        path, n = self.live_log_path, self.live_log_row_count
+        try:
+            if self.live_log_fh is not None:
+                self.live_log_fh.flush()
+                self.live_log_fh.close()
+        except Exception:
+            pass
+        self.live_log_fh = None
+        self.live_log_writer = None
+        if path is not None:
+            self.log.append(f"Live-Log gestoppt: {n} Zeilen in {path}")
+
+    def write_live_log_row(self, s: Sample):  # 0.5.9.26
+        if not self.live_log_enabled or self.live_log_writer is None:
+            return
+        try:
+            self.live_log_writer.writerow(_dc_astuple(s))
+            self.live_log_row_count += 1
+            if self.live_log_row_count % 20 == 0:  # ~alle 2s flushen, Datenverlust bei Absturz begrenzen
+                self.live_log_fh.flush()
+        except Exception as e:
+            self.log.append(f"Live-Log-Fehler, wird gestoppt: {e}")
+            self.stop_live_log()
+
     def toggle_auto_bestlap_export(self):
         self.auto_bestlap_export_enabled = not self.auto_bestlap_export_enabled
         self.set_auto_bestlap_ui()
         self.log.append("Auto-Bestlap-Export " + ("aktiviert" if self.auto_bestlap_export_enabled else "deaktiviert"))
         self.refresh_dashboard()
+
+    def set_auto_switch_ui(self):  # 0.5.9.24
+        state = "AN" if self.auto_switch_recording_enabled else "AUS"
+        self.btn_auto_switch.setText(f"Auto-Wechsel: {state}")
+        self.btn_auto_switch.setToolTip(
+            "Bei Strecken-/Fahrzeugwechsel während der Aufnahme automatisch stoppen "
+            "(Report/CSV speichern) und für den neuen Kontext neu starten."
+        )
+
+    def toggle_auto_switch_recording(self):  # 0.5.9.24
+        self.auto_switch_recording_enabled = not self.auto_switch_recording_enabled
+        self.set_auto_switch_ui()
+        self.log.append("Auto-Wechsel-Neustart " + ("aktiviert" if self.auto_switch_recording_enabled else "deaktiviert"))
 
     def toggle_auto_bestlap_hotkey(self):
         # F7 kann durch Stream Deck + App-Shortcut + Windows-Polling doppelt feuern.
@@ -8597,6 +8997,29 @@ $all | Where-Object { $_.Name -or $_.DeviceID } | ConvertTo-Json -Depth 3
             self.log.append(f"Recording-Fahrzeug gelockt: {self.sample_vehicle_label(sig)}")
             return True
         if sig != self.recording_signature:
+            # 0.5.9.24: Strecken-/Fahrzeugwechsel während der Aufnahme. Statt die Samples
+            # nur endlos zu verwerfen: nach einer stabilen Serie desselben NEUEN Signaturs
+            # (Debounce gegen einzelne verrauschte/kurz falsche Frames) die laufende Session
+            # automatisch stoppen (Report/CSV/Referenz werden dabei wie gewohnt gespeichert)
+            # und sofort neu starten, damit sich der neue Kontext frisch einlockt.
+            if self.auto_switch_recording_enabled and not self.is_prelock_non_driving_sample(s):
+                if self.pending_switch_signature == sig:
+                    self.pending_switch_count += 1
+                else:
+                    self.pending_switch_signature = sig
+                    self.pending_switch_count = 1
+                if self.pending_switch_count >= AUTO_SWITCH_DEBOUNCE_SAMPLES:
+                    old_label = self.sample_vehicle_label(self.recording_signature)
+                    new_label = self.sample_vehicle_label(sig)
+                    self.pending_switch_signature = None
+                    self.pending_switch_count = 0
+                    self.log.append(
+                        f"Automatischer Wechsel erkannt: {new_label} statt {old_label} – "
+                        "aktuelle Session wird gespeichert, neue Aufnahme startet automatisch."
+                    )
+                    self.stop_recording()
+                    self.start_recording()
+                    return False  # dieses Sample gehört zur alten Session, bereits geschlossen
             self.rejected_sample_count += 1
             if self.rejected_sample_count in (1, 5, 20) or self.rejected_sample_count % 100 == 0:
                 self.log.append(
@@ -8605,12 +9028,50 @@ $all | Where-Object { $_.Name -or $_.DeviceID } | ConvertTo-Json -Depth 3
                     f"({self.rejected_sample_count} verworfen)"
                 )
             return False
+        # Kontinuierlich passendes Signal: Wechsel-Verdacht zurücksetzen.
+        self.pending_switch_signature = None
+        self.pending_switch_count = 0
         # Harte Stand-/Pit-Samples nach dem Lock dürfen nicht in Auswertungen/CSV dominieren.
         # Langsame Kurven werden NICHT verworfen, nur echte Pit/Garage/0-RPM/0-Speed-Zustände.
         if self.is_hard_garage_sample(s):
             self.rejected_sample_count += 1
             return False
         return True
+
+    def update_live_smooth_lap_clock(self, s: Sample):
+        """0.5.9.26: main.mTimeIntoLap (current_lap_time) kommt aus dem LMU-Scoring-
+        Block, der spuerbar seltener aktualisiert als die Telemetrie -> im
+        Rundenzeiten-Overlay "AKTUELL" blieb der Wert zwischendurch kurz stehen statt
+        smooth mitzulaufen ("nicht 1:1 real-time"), obwohl wir selbst mit vollen 10 Hz
+        pollen. Fix: eigene Echtzeit-Uhr per time.monotonic() zwischen den Sim-Updates,
+        die sich bei jedem ECHTEN neuen Sim-Wert (oder Rundenwechsel/Reset/Pause)
+        selbst resynchronisiert -> bleibt exakt am Sim-Stand, laeuft dazwischen aber
+        sichtbar fluessig. Rein additiv, current_lap_time selbst bleibt unveraendert
+        als Fallback vorhanden.
+        """
+        try:
+            raw = float(getattr(s, "current_lap_time", 0.0) or 0.0)
+            lap = int(getattr(s, "lap_number", 0) or 0)
+        except Exception:
+            self.live_smooth_lap_time = None
+            return
+        now = time.monotonic()
+        anchor_raw = self._live_clock_anchor_raw
+        anchor_ts = self._live_clock_anchor_ts
+        predicted = (anchor_raw + (now - anchor_ts)) if anchor_raw is not None and anchor_ts is not None else None
+        resync = (
+            raw <= 0.0
+            or lap != self._live_clock_lap
+            or predicted is None
+            or abs(raw - predicted) > 0.35  # Sprung -> Boxenstopp/Reset/neuer Sim-Wert weicht ab
+        )
+        if resync:
+            self._live_clock_anchor_raw = raw
+            self._live_clock_anchor_ts = now
+            self._live_clock_lap = lap
+            self.live_smooth_lap_time = raw
+        else:
+            self.live_smooth_lap_time = predicted
 
     def live_tick(self):
         """Live-Abfrage für Overlay, unabhängig vom Recording.
@@ -8622,6 +9083,8 @@ $all | Where-Object { $_.Name -or $_.DeviceID } | ConvertTo-Json -Depth 3
         except Exception:
             return
         self.last_live_sample = s
+        self.update_live_smooth_lap_clock(s)  # 0.5.9.26
+        self.write_live_log_row(s)  # 0.5.9.26
         self.maybe_autoshow_tire_overlay(s)
         self.update_live_lap_buffer(s)
         self.compute_live_reference_delta()
@@ -8824,7 +9287,7 @@ $all | Where-Object { $_.Name -or $_.DeviceID } | ConvertTo-Json -Depth 3
         if self.recording:
             self.log.append("Recording läuft bereits – Start ignoriert.")
             return
-        self.samples.clear(); self.lap_summaries.clear(); self.reference_lap = None; self.compare_lap = None; self.segment_deltas = []; self.manual_reference_lap = None; self.manual_compare_lap = None; self.auto_bestlap_export_path = None; self.auto_bestlap_lap_number = None; self.auto_bestlap_time_s = None; self.live_best_reference_segments = {}; self.live_best_reference_lap = None; self.live_best_reference_time_s = None; self.recording_signature = None; self.rejected_sample_count = 0; self.live_summary.setRowCount(0); self.segment_table.setRowCount(0); self.zone_table.setRowCount(0); self.laps_table.setRowCount(0); self.lap_overview_table.setRowCount(0); self.compare_table.setRowCount(0); self.coach_text.clear(); self.limit_coach_text.clear() if hasattr(self, "limit_coach_text") else None;
+        self.samples.clear(); self.lap_summaries.clear(); self.reference_lap = None; self.compare_lap = None; self.segment_deltas = []; self.manual_reference_lap = None; self.manual_compare_lap = None; self.auto_bestlap_export_path = None; self.auto_bestlap_lap_number = None; self.auto_bestlap_time_s = None; self.live_best_reference_segments = {}; self.live_best_reference_lap = None; self.live_best_reference_time_s = None; self.recording_signature = None; self.rejected_sample_count = 0; self.pending_switch_signature = None; self.pending_switch_count = 0; self.live_summary.setRowCount(0); self.segment_table.setRowCount(0); self.zone_table.setRowCount(0); self.laps_table.setRowCount(0); self.lap_overview_table.setRowCount(0); self.compare_table.setRowCount(0); self.coach_text.clear(); self.limit_coach_text.clear() if hasattr(self, "limit_coach_text") else None;
         self.input_table.setRowCount(0) if hasattr(self, "input_table") else None; self.input_coach_text.clear() if hasattr(self, "input_coach_text") else None; self.trackmap.set_samples([]);
         self.heatmap.set_samples([]) if hasattr(self, 'heatmap') else None; self.refresh_lap_combos()
         self.recording = True; self.timer.start()
@@ -9019,7 +9482,7 @@ $all | Where-Object { $_.Name -or $_.DeviceID } | ConvertTo-Json -Depth 3
                 min_speed = min(speeds); max_speed = max(speeds); avg_speed = sum(speeds)/len(speeds)
                 max_brake = max(brakes); avg_thr = sum(thrs)/len(thrs)
             else:
-                start_m = end_m = coverage = duration = min_speed = max_speed = avg_speed = max_brake = avg_thr = fuel_start = fuel_end = fuel_used = 0.0
+                start_m = end_m = coverage = duration = min_speed = max_speed = avg_speed = max_brake = avg_thr = fuel_start = fuel_end = fuel_used = official_lmu_time = 0.0
             invalidated = any(r.lap_invalidated for r in rows)
             in_pits = any(r.in_pits for r in rows)
             has_standstill = any(self.is_non_driving_sample(r) for r in rows)
@@ -10559,6 +11022,11 @@ $all | Where-Object { $_.Name -or $_.DeviceID } | ConvertTo-Json -Depth 3
             self.status.setText(f"CSV gespeichert: {default}")
         else:
             QMessageBox.warning(self, "CSV speichern", f"CSV konnte nicht gespeichert werden. Siehe Log. Ziel: {default}")
+
+    def closeEvent(self, event):  # 0.5.9.26: Live-Log beim Beenden sauber schliessen
+        if getattr(self, "live_log_enabled", False):
+            self.stop_live_log()
+        super().closeEvent(event)
 
 
 def main():
