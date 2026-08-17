@@ -1,0 +1,13 @@
+SimHub-Referenzwerte für Vergleich:
+
+Speed      = DataCorePlugin.GameData.NewData.SpeedKmh
+Gear       = DataCorePlugin.GameData.NewData.Gear
+Fuel       = DataCorePlugin.GameData.NewData.Fuel
+RPM        = DataCorePlugin.GameData.NewData.Rpms
+Throttle   = DataCorePlugin.GameData.NewData.Throttle
+Brake      = DataCorePlugin.GameData.NewData.Brake
+Steering   = DataCorePlugin.GameRawData.CurrentPlayerTelemetry.mFilteredSteering
+Track X    = DataCorePlugin.GameData.NewData.CarCoordinates01
+Track Z    = DataCorePlugin.GameData.NewData.CarCoordinates03
+Track m    = DataCorePlugin.GameData.NewData.TrackPositionMeters
+Lap        = DataCorePlugin.GameData.NewData.CurrentLap
